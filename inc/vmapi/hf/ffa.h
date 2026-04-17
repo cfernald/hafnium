@@ -331,6 +331,17 @@ static inline const char *ffa_error_name(enum ffa_error error)
 
 /**
  * Defined in Table 3.1 in the FF-A v.1.2 memory management supplement.
+ * For FFA_MEM_DONATE, FFA_MEM_LEND and FFA_MEM_SHARE.
+ * Input properties:
+ * - Bits[31:0] are reserved (SBZ).
+ * Output properties:
+ * - Bit[0]: dynamically allocated buffer support.
+ * - Bits[31:1] are reserved (MBZ).
+ */
+#define FFA_FEATURES_MEM_SEND_BUFFER_SUPPORT (1U << 0U)
+
+/**
+ * Defined in Table 3.1 in the FF-A v.1.2 memory management supplement.
  * Input properties:
  * - Bits[31:2] and Bit[0] are reserved (SBZ).
  * Output properties:

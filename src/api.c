@@ -2488,12 +2488,6 @@ static struct ffa_value ffa_features_function(uint32_t func,
 	case FFA_ID_GET_32:
 	case FFA_MSG_WAIT_32:
 	case FFA_RUN_32:
-	case FFA_MEM_DONATE_64:
-	case FFA_MEM_DONATE_32:
-	case FFA_MEM_LEND_32:
-	case FFA_MEM_LEND_64:
-	case FFA_MEM_SHARE_32:
-	case FFA_MEM_SHARE_64:
 	case FFA_MEM_RETRIEVE_RESP_32:
 	case FFA_MEM_RELINQUISH_32:
 	case FFA_MEM_RECLAIM_32:
@@ -2504,6 +2498,16 @@ static struct ffa_value ffa_features_function(uint32_t func,
 	case FFA_MSG_SEND_DIRECT_REQ_64:
 	case FFA_MSG_SEND_DIRECT_REQ_32:
 		return api_ffa_feature_success(0);
+
+	/* Memory send functions support dynamic buffer. */
+	case FFA_MEM_DONATE_64:
+	case FFA_MEM_DONATE_32:
+	case FFA_MEM_LEND_32:
+	case FFA_MEM_LEND_64:
+	case FFA_MEM_SHARE_32:
+	case FFA_MEM_SHARE_64:
+		return api_ffa_feature_success(
+			FFA_FEATURES_MEM_SEND_BUFFER_SUPPORT);
 
 	/* FF-A v1.1 features. */
 	case FFA_SPM_ID_GET_32:
@@ -3473,12 +3477,25 @@ struct ffa_value api_ffa_mem_send(uint32_t share_func, uint32_t length,
 	struct ffa_value ret;
 	bool targets_other_world = false;
 	enum ffa_version ffa_version;
+	bool dynamic_buffer = false;
+	struct mm_stage1_locked stage1_locked;
+	paddr_t dyn_pa_begin;
+	paddr_t dyn_pa_end;
 
-	if (ipa_addr(address) != 0 || page_count != 0) {
-		/*
-		 * Hafnium only supports passing the descriptor in the TX
-		 * mailbox.
-		 */
+	/*
+	 * Determine whether the caller is using a dynamically allocated
+	 * buffer (non-zero address and page_count) or the TX mailbox
+	 * (both zero). Mixed zero/non-zero is invalid.
+	 */
+	if (ipa_addr(address) != 0 && page_count != 0) {
+		dynamic_buffer = true;
+		dlog_verbose(
+			"%s: Dynamic buffer requested: addr=%#lx pages=%u.\n",
+			__func__, ipa_addr(address), page_count);
+	} else if (ipa_addr(address) != 0 || page_count != 0) {
+		dlog_verbose(
+			"Dynamic buffer address and page_count must both be "
+			"zero or both non-zero.\n");
 		return ffa_error(FFA_INVALID_PARAMETERS);
 	}
 
@@ -3489,23 +3506,40 @@ struct ffa_value api_ffa_mem_send(uint32_t share_func, uint32_t length,
 		return ffa_error(FFA_INVALID_PARAMETERS);
 	}
 
-	if (fragment_length > HF_MAILBOX_SIZE ||
-	    fragment_length > MM_PPOOL_ENTRY_SIZE) {
-		return ffa_error(FFA_INVALID_PARAMETERS);
+	if (dynamic_buffer) {
+		/*
+		 * For dynamic buffers the fragment must fit within the
+		 * supplied buffer and within our internal page size.
+		 */
+		if (fragment_length > (uint64_t)page_count * FFA_PAGE_SIZE ||
+		    fragment_length > MM_PPOOL_ENTRY_SIZE) {
+			dlog_verbose(
+				"Fragment length %d too large for dynamic "
+				"buffer (%u pages) or internal limit.\n",
+				fragment_length, page_count);
+			return ffa_error(FFA_INVALID_PARAMETERS);
+		}
+	} else {
+		if (fragment_length > HF_MAILBOX_SIZE ||
+		    fragment_length > MM_PPOOL_ENTRY_SIZE) {
+			return ffa_error(FFA_INVALID_PARAMETERS);
+		}
 	}
 
 	/*
 	 * Check that the sender has configured its send buffer. If the TX
 	 * mailbox at from_msg is configured (i.e. from_msg != NULL) then it can
 	 * be safely accessed after releasing the lock since the TX mailbox
-	 * address can only be configured once.
+	 * address can only be configured once. If the caller is using a dynamic
+	 * buffer then this will be ignored and the dynamic buffer will be mapped
+	 * and used instead.
 	 */
 	sl_lock(&from->lock);
-	from_msg = from->mailbox.send;
 	ffa_version = from->ffa_version;
+	from_msg = from->mailbox.send;
 	sl_unlock(&from->lock);
 
-	if (from_msg == NULL) {
+	if (!dynamic_buffer && from_msg == NULL) {
 		return ffa_error(FFA_INVALID_PARAMETERS);
 	}
 
@@ -3520,13 +3554,44 @@ struct ffa_value api_ffa_mem_send(uint32_t share_func, uint32_t length,
 		return ffa_error(FFA_NO_MEMORY);
 	}
 
-	if (!memcpy_trapped(allocated_entry, MM_PPOOL_ENTRY_SIZE, from_msg,
-			    fragment_length)) {
-		dlog_error(
-			"%s: Failed to copy FF-A memory region descriptor.\n",
-			__func__);
-		ret = ffa_error(FFA_ABORTED);
-		goto out;
+	if (dynamic_buffer) {
+		/*
+		 * Map the caller's dynamic buffer into the hypervisor's
+		 * stage-1 page table so we can read the descriptor. Only
+		 * keep it mapped long enough to copy the data.
+		 */
+		dyn_pa_begin = pa_from_ipa(address);
+		dyn_pa_end = pa_add(dyn_pa_begin,
+				    (size_t)page_count * FFA_PAGE_SIZE);
+
+		stage1_locked = mm_lock_stage1();
+		from_msg = mm_identity_map(stage1_locked, dyn_pa_begin,
+					     dyn_pa_end, MM_MODE_R,
+					     &api_page_pool);
+		if (from_msg == NULL) {
+			mm_unlock_stage1(&stage1_locked);
+			dlog_error(
+				"%s: Failed to map dynamic buffer at %#lx "
+				"(end=%#lx).\n",
+				__func__, pa_addr(dyn_pa_begin),
+				pa_addr(dyn_pa_end));
+			return ffa_error(FFA_INVALID_PARAMETERS);
+		}
+	}
+
+	memcpy_s(allocated_entry, MM_PPOOL_ENTRY_SIZE, from_msg,
+		 fragment_length);
+
+	/*
+	 * Unmap the dynamic buffer now that we've copied the descriptor.
+	 * We no longer need access to the caller's buffer. Set to NULL to
+	 * prevent accidental usage after this point.
+	 */
+	if (dynamic_buffer) {
+		CHECK(mm_unmap(stage1_locked, dyn_pa_begin, dyn_pa_end,
+			       &api_page_pool));
+		mm_unlock_stage1(&stage1_locked);
+		from_msg = NULL;
 	}
 
 	/*
